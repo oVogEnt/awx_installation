@@ -1,0 +1,192 @@
+---
+- name: Instalar AWX
+  hosts: awx
+  become: true
+  vars:
+    # awx_operator_version: "2.19.1"
+    awx_namespace: "awx"
+    bastion_install_dir: /tmp/awx
+  pre_tasks:
+    - name: Instalar paquetes requeridos
+      ansible.builtin.dnf:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - epel-release
+        - git
+        - make
+        - firewalld
+        - podman
+        - python3-pip
+
+  tasks:
+    - name: Iniciar y habilitar firewalld
+      ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: Asegurar que firewalld use iptables en lugar de nftables
+      ansible.builtin.lineinfile:
+        path: /etc/firewalld/firewalld.conf
+        regexp: "^FirewallBackend"
+        line: "FirewallBackend=iptables"
+
+    - name: Reiniciar firewalld
+      ansible.builtin.service:
+        name: firewalld
+        state: restarted
+
+    - name: Descargar el script de instalación de k3s
+      ansible.builtin.get_url:
+        url: https://get.k3s.io/
+        dest: /root/k3s_install.sh
+        mode: '0755'
+
+    - name: Instalar k3s
+      ansible.builtin.command:
+        cmd: /root/k3s_install.sh --write-kubeconfig-mode 644 --selinux --kubelet-arg "container-log-max-files=4" --kubelet-arg "container-log-max-size=50Mi"
+        creates: /etc/rancher/k3s/k3s.yaml
+      environment:
+        INSTALL_K3S_BIN_DIR: /usr/bin
+
+    - name: Permitir que k3s despliegue correctamente los servicios predeterminados, esperar 3m
+      ansible.builtin.wait_for:
+        timeout: 180
+
+    - name: Instalar la biblioteca Python de Kubernetes
+      ansible.builtin.pip:
+        name: kubernetes
+        state: present
+
+    - name: Crear /root/.kube
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+
+    - name: Copiar Kubeconfig al directorio home
+      ansible.builtin.command:
+        cmd: cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
+
+    - name: Establecer la versión de AWX Operator si no está establecida
+      block:
+        - name: Obtener etiquetas del repositorio de AWX Operator
+          ansible.builtin.uri:
+            url: "https://api.github.com/repos/ansible/awx-operator/tags"
+            return_content: yes
+          register: awx_tags_response
+
+        - name: Usar la versión más reciente de AWX Operator
+          set_fact:
+            awx_operator_version: >-
+              {{
+                awx_tags_response.json | map(attribute='name') | map('split', '.') |
+                map('map', 'int') | sort(reverse=True) | map('join', '.') | first
+              }}
+      when: awx_operator_version is not defined
+
+    - name: Clonar el repositorio de AWX Operator
+      ansible.builtin.git:
+        repo: 'https://github.com/ansible/awx-operator.git'
+        dest: '/root/awx-operator'
+        version: "tags/{{ awx_operator_version }}"
+        force: yes
+
+    - name: Crear el espacio de nombres de Kubernetes para AWX
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ awx_namespace }}"
+
+    - name: Crear directorio de kustomization
+      ansible.builtin.file:
+        path: "{{ bastion_install_dir }}/kustomization"
+        state: directory
+
+    - name: Crear archivo kustomization.yaml
+      ansible.builtin.copy:
+        dest: "{{ bastion_install_dir }}/kustomization/kustomization.yaml"
+        content: |
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          resources:
+            - github.com/ansible/awx-operator/config/default?ref={{ awx_operator_version }}
+          images:
+            - name: quay.io/ansible/awx-operator
+              newTag: {{ awx_operator_version }}
+          namespace: {{ awx_namespace }}
+
+    - name: Aplicar CRDs de AWX Operator
+      ansible.builtin.command:
+        cmd: kubectl apply -k .
+      args:
+        chdir: "{{ bastion_install_dir }}/kustomization"
+
+    - name: Permitir que los CRDs de AWX se desplieguen correctamente, esperar 30s
+      ansible.builtin.wait_for:
+        timeout: 30
+
+    - name: Crear archivo awx.yml
+      ansible.builtin.copy:
+        dest: "{{ bastion_install_dir }}/kustomization/awx.yml"
+        content: |
+          apiVersion: awx.ansible.com/v1beta1
+          kind: AWX
+          metadata:
+            name: awx
+          spec:
+            service_type: nodeport
+
+    - name: Actualizar kustomization.yaml para incluir awx.yml
+      ansible.builtin.lineinfile:
+        path: "{{ bastion_install_dir }}/kustomization/kustomization.yaml"
+        line: "  - awx.yml"
+        insertafter: "resources:"
+
+    - name: Desplegar instancia de AWX
+      ansible.builtin.command:
+        cmd: kubectl apply -k .
+      args:
+        chdir: "{{ bastion_install_dir }}/kustomization"
+
+    - name: Esperar a que la instancia de AWX esté lista
+      ansible.builtin.shell: |
+        until kubectl get pods -n "{{ awx_namespace }}" -l app.kubernetes.io/name=awx-web -o jsonpath='{.items[*].status.phase}' | grep -q 'Running'; do
+          echo "Esperando a que la instancia de AWX esté lista...";
+          sleep 30;
+        done
+      register: awx_instance_ready
+      retries: 25
+      delay: 30
+      until: awx_instance_ready is success
+
+    - name: Obtener la contraseña de administrador de AWX
+      ansible.builtin.shell: |
+        kubectl get secret awx-admin-password -n "{{ awx_namespace }}" -o jsonpath="{.data.password}" | base64 -d
+      register: awx_admin_password
+      changed_when: false
+
+    - name: Obtener el puerto NodePort del servicio de AWX
+      ansible.builtin.shell: |
+        kubectl get service awx-service -n "{{ awx_namespace }}" -o jsonpath="{.spec.ports[0].nodePort}"
+      register: awx_service_port
+      changed_when: false
+
+    - name: Guardar los detalles de acceso a AWX en un archivo
+      ansible.builtin.copy:
+        dest: "/tmp/awx_access_details.txt"
+        content: |
+          Contraseña de administrador de AWX: {{ awx_admin_password.stdout }}
+          URL de AWX: http://{{ ansible_default_ipv4.address }}:{{ awx_service_port.stdout }}
+        mode: '0644'
+
+    - name: Depurar el contenido que se guardará en el archivo
+      debug:
+        msg: |
+          Contraseña de administrador de AWX: {{ awx_admin_password.stdout }}
+          URL de AWX: http://{{ ansible_default_ipv4.address }}:{{ awx_service_port.stdout }}
+          Credenciales guardadas en /tmp/awx_access_details.txt
+

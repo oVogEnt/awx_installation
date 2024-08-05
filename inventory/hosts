@@ -1,0 +1,2 @@
+[all]
+awx ansible_host=10.208.162.55
