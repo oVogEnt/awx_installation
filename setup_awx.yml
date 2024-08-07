@@ -6,6 +6,7 @@
     # awx_operator_version: "2.19.1"
     awx_namespace: "awx"
     bastion_install_dir: /tmp/awx
+    persistent_container_storage_dir: /srv/containers
   pre_tasks:
     - name: Instalar paquetes requeridos
       ansible.builtin.dnf:
@@ -20,6 +21,13 @@
         - python3-pip
 
   tasks:
+    - name: Verwijder namespace awx als delete_ns true is
+      kubernetes.core.k8s:
+        state: absent
+        kind: Namespace
+        name: "{{ awx_namespace }}"
+      when: delete_ns | default(false) | bool
+
     - name: Iniciar y habilitar firewalld
       ansible.builtin.service:
         name: firewalld
@@ -50,9 +58,9 @@
       environment:
         INSTALL_K3S_BIN_DIR: /usr/bin
 
-    - name: Permitir que k3s despliegue correctamente los servicios predeterminados, esperar 3m
-      ansible.builtin.wait_for:
-        timeout: 180
+      #    - name: Permitir que k3s despliegue correctamente los servicios predeterminados, esperar 3m
+      #      ansible.builtin.wait_for:
+      #        timeout: 180
 
     - name: Instalar la biblioteca Python de Kubernetes
       ansible.builtin.pip:
@@ -67,6 +75,34 @@
     - name: Copiar Kubeconfig al directorio home
       ansible.builtin.command:
         cmd: cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
+
+    - name: Execute shell script to get new AWX helm
+      ansible.builtin.shell: |
+        "/usr/bin/helm version" 
+      register: helm_installed
+      ignore_errors: true
+      changed_when: false
+      become: true
+    
+    - block:
+        - name: Download Helm command line tool
+          ansible.builtin.uri:
+            url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+            return_content: true
+          register: helm_installer
+    
+        - name: Install Helm
+          ansible.builtin.command:
+            cmd: bash
+            stdin: "{{ helm_installer.content }}"
+            creates: /usr/local/bin/helm
+    
+        - name: Copy helm binary to /usr/bin
+          ansible.builtin.command: "cp /usr/local/bin/helm /usr/bin/helm"
+          args:
+            creates: /usr/bin/helm
+      when: helm_installed.failed
+
 
     - name: Establecer la versión de AWX Operator si no está establecida
       block:
@@ -85,6 +121,39 @@
               }}
       when: awx_operator_version is not defined
 
+    - name: Create necessary directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ bastion_install_dir }}/awx/kustomize/base"
+        - "{{ bastion_install_dir }}/awx/kustomize/overlays/prd"
+        - "{{ persistent_container_storage_dir }}/awx/postgres-15/data/userdata"
+        - "{{ persistent_container_storage_dir }}/awx/projects"
+
+    - name: Set permissions for AWX postgres directory
+      ansible.builtin.file:
+        path: "{{ persistent_container_storage_dir }}/awx/postgres-15"
+        mode: '0755'
+        recurse: yes
+
+    - name: Set ownership for AWX postgres userdata directory
+      ansible.builtin.file:
+        path: "{{ persistent_container_storage_dir }}/awx/postgres-15/data/userdata"
+        owner: 26
+        group: 26
+        mode: '0700'
+        recurse: yes
+
+    - name: Set ownership for AWX project directory
+      ansible.builtin.file:
+        path: "{{ persistent_container_storage_dir }}/awx/projects"
+        owner: 1000
+        group: 0
+        #group: 1000
+        mode: '0755'
+        recurse: yes
+
     - name: Clonar el repositorio de AWX Operator
       ansible.builtin.git:
         repo: 'https://github.com/ansible/awx-operator.git'
@@ -101,65 +170,79 @@
           metadata:
             name: "{{ awx_namespace }}"
 
-    - name: Crear directorio de kustomization
-      ansible.builtin.file:
-        path: "{{ bastion_install_dir }}/kustomization"
-        state: directory
+    - name: Add shell script to get AWX helm templates of new version
+      ansible.builtin.template:
+        src: "templates/get_new_awx_templates.sh.j2"
+        dest: "{{ bastion_install_dir }}/awx/get_new_awx_templates.sh"
+        mode: '0755'
 
-    - name: Crear archivo kustomization.yaml
-      ansible.builtin.copy:
-        dest: "{{ bastion_install_dir }}/kustomization/kustomization.yaml"
-        content: |
-          apiVersion: kustomize.config.k8s.io/v1beta1
-          kind: Kustomization
-          resources:
-            - github.com/ansible/awx-operator/config/default?ref={{ awx_operator_version }}
-          images:
-            - name: quay.io/ansible/awx-operator
-              newTag: {{ awx_operator_version }}
-          namespace: {{ awx_namespace }}
-
-    - name: Aplicar CRDs de AWX Operator
-      ansible.builtin.command:
-        cmd: kubectl apply -k .
-      args:
-        chdir: "{{ bastion_install_dir }}/kustomization"
-
-    - name: Permitir que los CRDs de AWX se desplieguen correctamente, esperar 30s
-      ansible.builtin.wait_for:
-        timeout: 30
-
-    - name: Crear archivo awx.yml
-      ansible.builtin.copy:
-        dest: "{{ bastion_install_dir }}/kustomization/awx.yml"
-        content: |
-          apiVersion: awx.ansible.com/v1beta1
-          kind: AWX
-          metadata:
-            name: awx
-          spec:
-            service_type: nodeport
-
-    - name: Actualizar kustomization.yaml para incluir awx.yml
-      ansible.builtin.lineinfile:
-        path: "{{ bastion_install_dir }}/kustomization/kustomization.yaml"
-        line: "  - awx.yml"
-        insertafter: "resources:"
-
-    - name: Desplegar instancia de AWX
-      ansible.builtin.command:
-        cmd: kubectl apply -k .
-      args:
-        chdir: "{{ bastion_install_dir }}/kustomization"
-
-    - name: Esperar a que la instancia de AWX esté lista
+    - name: Run script
       ansible.builtin.shell: |
-        until kubectl get pods -n "{{ awx_namespace }}" -l app.kubernetes.io/name=awx-web -o jsonpath='{.items[*].status.phase}' | grep -q 'Running'; do
-          echo "Esperando a que la instancia de AWX esté lista...";
+        "{{ bastion_install_dir }}/awx/get_new_awx_templates.sh"
+      args:
+        executable: /bin/bash
+      become: true
+
+    - name: Remove shell script after execution
+      ansible.builtin.file:
+        path: "{{ bastion_install_dir }}/awx/get_new_awx_templates.sh"
+        state: absent
+
+    - name: Find template files
+      ansible.builtin.find:
+        paths: "{{ bastion_install_dir }}/awx/kustomize/base/awx-operator/templates/"
+        patterns: "*.yaml"
+      register: template_files
+
+    - name: Copy kustomization base files
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ bastion_install_dir }}/awx/kustomize/base/{{ item.dest }}"
+      loop:
+        - { src: "templates/kustomization/base/pvc.yaml.j2", dest: "pvc.yaml" }
+        - { src: "templates/kustomization/base/pv.yaml.j2", dest: "pv.yaml" }
+        - { src: "templates/kustomization/base/storageclass.yaml.j2", dest: "storageclass.yaml" }
+        - { src: "templates/kustomization/base/awx.yaml.j2", dest: "awx.yaml" }
+        - { src: "templates/kustomization/base/kustomization.yaml.j2", dest: "kustomization.yaml" }
+        - { src: "templates/kustomization/base/namespace.yaml.j2", dest: "namespace.yaml" }
+
+    - name: Restore SELinux context
+      ansible.builtin.command: "restorecon -Rv -F {{ persistent_container_storage_dir }}/awx"
+
+    - name: Add template files to kustomization.yaml
+      ansible.builtin.template:
+        src: "templates/kustomization/base/kustomization.yaml.j2"
+        dest: "{{ bastion_install_dir }}/awx/kustomize/base/kustomization.yaml"
+      when: template_files.matched > 0
+
+    - name: Install AWX CRDs
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ item }}
+      loop:
+        - https://raw.githubusercontent.com/ansible/awx-operator/devel/config/crd/bases/awx.ansible.com_awxs.yaml
+        - https://raw.githubusercontent.com/ansible/awx-operator/devel/config/crd/bases/awx.ansible.com_awxbackups.yaml
+        - https://raw.githubusercontent.com/ansible/awx-operator/devel/config/crd/bases/awx.ansible.com_awxrestores.yaml
+        - https://raw.githubusercontent.com/ansible/awx-operator/devel/config/crd/bases/awx.ansible.com_awxmeshingresses.yaml
+
+    - name: Create awx namespace
+      ansible.builtin.command:
+        cmd: kubectl create ns awx
+      register: create_ns_result
+      failed_when: create_ns_result.rc != 0 and "already exists" not in create_ns_result.stderr
+      changed_when: "'created' in create_ns_result.stdout"
+
+    - name: deploy awx
+      ansible.builtin.command:
+        cmd: "kubectl apply -k {{ bastion_install_dir }}/awx/kustomize/base"
+
+    - name: Wait for AWX instance to be ready
+      ansible.builtin.shell: |
+        until kubectl get pods -n "awx" -l app.kubernetes.io/name=awx-web -o jsonpath='{.items[*].status.phase}' | grep -q 'Running'; do
+          echo "Waiting for AWX instance to be ready...";
           sleep 30;
         done
       register: awx_instance_ready
-      retries: 25
+      retries: 75
       delay: 30
       until: awx_instance_ready is success
 

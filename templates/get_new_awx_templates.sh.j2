@@ -1,0 +1,10 @@
+#!/bin/bash
+
+rm {{ bastion_install_dir }}/awx/kustomize/base/awx-operator/template/* 2> /dev/null
+
+helm repo add awx-operator https://ansible.github.io/awx-operator/
+helm repo update
+
+mkdir -p {{ bastion_install_dir }}/awx/kustomize/base
+
+helm template awx-operator awx-operator/awx-operator --version {{ awx_operator_version }} --output-dir {{ bastion_install_dir }}/awx/kustomize/base
